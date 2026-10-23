@@ -12,6 +12,7 @@ import android.provider.MediaStore
 import android.util.Log
 import android.view.View
 import android.widget.*
+import androidx.activity.OnBackPressedCallback
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.appcompat.app.AppCompatActivity
 import androidx.core.content.ContextCompat
@@ -42,6 +43,9 @@ data class WordInfo(
 class MainActivity : AppCompatActivity() {
     companion object {
         private const val TAG = "OCRDemo"
+
+        /** 双击返回退出的判定间隔（毫秒） */
+        private const val EXIT_AGAIN_INTERVAL = 2000L
     }
 
     private data class LangInfo(val modelDir: String, val labelPath: String)
@@ -87,6 +91,11 @@ class MainActivity : AppCompatActivity() {
     private var resultText: String = ""
     private var selectedText: String = ""
 
+    // 返回键改造所需状态：识别进行中、结果是否作废、上一次按返回的时间戳
+    private var isRecognizing = false
+    private var discardResult = false
+    private var lastBackPressTime = 0L
+
     private val segmentBs: SegmentBs by lazy { SegmentBs.newInstance() }
     private val scope = CoroutineScope(Dispatchers.Main)
     private val db by lazy { HistoryDatabase.getInstance(this) }
@@ -122,6 +131,7 @@ class MainActivity : AppCompatActivity() {
         ocr = OCR(this)
         initViews()
         setupListeners()
+        setupBackHandling()
     }
 
     private fun initViews() {
@@ -271,6 +281,8 @@ class MainActivity : AppCompatActivity() {
         val bmp = currentBitmap ?: return
         if (!isModelLoaded) { tvStatus.text = "请先加载模型"; return }
         loadingOverlay.visibility = View.VISIBLE
+        isRecognizing = true
+        discardResult = false
         tvLoading.text = "正在识别..."
         val t0 = System.currentTimeMillis()
         ocr.run(bmp, object : OcrRunCallback {
@@ -304,6 +316,9 @@ class MainActivity : AppCompatActivity() {
                 val sw = segmentByLine(words, cp, lbg)
                 runOnUiThread {
                     loadingOverlay.visibility = View.GONE
+                    isRecognizing = false
+                    // 用户已强制中断识别，迟到的回调结果直接丢弃，避免又跳回结果页
+                    if (discardResult) return@runOnUiThread
                     allResultBoxes = boxes; allResultWords = words; allResultLines = rebuiltLines
                     segmentedWords = sw; resultText = rebuiltText
                     showResultUI(result, rebuiltLines, el, lbg)
@@ -312,6 +327,8 @@ class MainActivity : AppCompatActivity() {
             }
             override fun onFail(e: Throwable) = runOnUiThread {
                 loadingOverlay.visibility = View.GONE
+                isRecognizing = false
+                if (discardResult) return@runOnUiThread
                 tvStatus.text = "❌ 识别失败: ${e.message}"
                 Log.e(TAG, "识别失败", e)
             }
@@ -425,6 +442,9 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun resetToCapture() {
+        isRecognizing = false
+        discardResult = false
+        lastBackPressTime = 0L
         panelHome.visibility = View.VISIBLE; panelResult.visibility = View.GONE
         wordContainer.visibility = View.GONE; modeSwitchBar.visibility = View.GONE
         btnBack.visibility = View.GONE; emptyState.visibility = View.VISIBLE
@@ -575,8 +595,86 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
+    /**
+     * 返回键改造：把系统返回键从「直接退出」改成「逐级回退」。
+     *
+     * 原工程用 panelHome / panelResult 的显隐在同一个 Activity 内切换首页与结果页，
+     * 系统看不到任何可回退的层级，因此返回键只能走默认 finish()，而 MainActivity 是
+     * launcher 且在栈底，一按返回就把栈底销毁，表现为直接退出应用。
+     *
+     * 这里的回退顺序：识别中(拦截) -> 分词模式(回行模式) -> 结果页(回首页) -> 首页(连按两次才退出)。
+     * 采用 OnBackPressedDispatcher 而非已废弃的 onBackPressed()，兼容 targetSdk 33+ 的预测式返回手势。
+     */
+    private fun setupBackHandling() {
+        onBackPressedDispatcher.addCallback(this, object : OnBackPressedCallback(true) {
+            override fun handleOnBackPressed() {
+                // 第 1 级：识别进行中先拦住，连按两次则强制中断并回首页
+                if (isRecognizing) {
+                    val now = System.currentTimeMillis()
+                    if (now - lastBackPressTime < EXIT_AGAIN_INTERVAL) {
+                        Toast.makeText(this@MainActivity, "已中断识别", Toast.LENGTH_SHORT).show()
+                        forceAbortRecognize()
+                    } else {
+                        lastBackPressTime = now
+                        Toast.makeText(this@MainActivity, "正在识别，请稍候；再按一次可中断", Toast.LENGTH_SHORT).show()
+                    }
+                    return
+                }
+
+                // 第 2 级：结果页处于分词(词)模式时，返回键先切回逐行模式
+                if (isResultShown() && currentMode == 2) {
+                    switchMode(1)
+                    return
+                }
+
+                // 第 3 级：结果页 -> 回到首页，等价于点右上角返回按钮
+                if (isResultShown()) {
+                    resetToCapture()
+                    return
+                }
+
+                // 第 4 级：已在首页，连按两次才真正退出，避免误触
+                val now = System.currentTimeMillis()
+                if (now - lastBackPressTime < EXIT_AGAIN_INTERVAL) {
+                    // 先关掉本回调，把事件交回系统默认处理（finish），再恢复以免状态残留
+                    isEnabled = false
+                    this@MainActivity.onBackPressedDispatcher.onBackPressed()
+                    isEnabled = true
+                } else {
+                    lastBackPressTime = now
+                    Toast.makeText(this@MainActivity, "再按一次退出应用", Toast.LENGTH_SHORT).show()
+                }
+            }
+        })
+    }
+
+    /** 当前是否停留在识别结果页（用面板可见性判断，避免额外状态位失同步） */
+    private fun isResultShown(): Boolean =
+        ::panelResult.isInitialized && panelResult.visibility == View.VISIBLE
+
+    /** 强制中断一次识别：作废结果、收起遮罩并回到首页 */
+    private fun forceAbortRecognize() {
+        discardResult = true
+        resetToCapture()
+        tvStatus.text = "已中断识别"
+    }
+
+    /**
+     * 可选替代方案：返回时只把面板切回首页，保留上一次的图片与识别结果，
+     * 再进结果页不用重新识别。若要采用，把第 3 级里的 resetToCapture() 换成 backToHomeOnly()。
+     */
+    @Suppress("unused")
+    private fun backToHomeOnly() {
+        panelHome.visibility = View.VISIBLE; panelResult.visibility = View.GONE
+        modeSwitchBar.visibility = View.GONE; btnBack.visibility = View.GONE
+        wordContainer.visibility = View.GONE
+        lastBackPressTime = 0L
+        tvStatus.text = "已保留上次识别结果"
+    }
+
     override fun onDestroy() {
         super.onDestroy()
+        isRecognizing = false
         if (isModelLoaded) ocr.releaseModel()
         try { segmentBs.destroy() } catch (_: Exception) {}
     }
